@@ -8,11 +8,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"sync"
+	"math/rand"
 	"time"
 
 	dclient "github.com/dgraph-io/dgraph/client"
 	"github.com/dgraph-io/dgraph/protos/api"
+	"github.com/korovkin/limiter"
 	"google.golang.org/grpc"
 	elastic "gopkg.in/olivere/elastic.v5"
 )
@@ -90,6 +91,7 @@ var (
 	elasticServer = flag.String("elastic", "", "elasticsearch server, e.g. http://192.168.128.237:9200")
 	dgraphServer  = flag.String("dgraph", "", "dgraph server, e.g. dgraph1.nj.us.nomail.net:9080")
 	watermark     = flag.String("watermark", "0", "watermark timestamp where we should start searching in elasticsearch")
+	maxThreads    = flag.Int("max-threads", 1000, "maximum number of goroutines running at once")
 )
 
 func main() {
@@ -127,27 +129,63 @@ func main() {
 	// extract
 	go extractElasticUserRelationships(client, *watermark, channel)
 
+	limit := limiter.NewConcurrencyLimiter(*maxThreads)
 	for elasticRelationship := range channel {
-		go transformAndLoad(elasticRelationship, dg)
+		limit.Execute(func() {
+			transformAndLoad(elasticRelationship, dg)
+		})
 	}
+	limit.Wait()
+}
+
+func retryFindOrCreatePerson(
+	personID string,
+	dg *dclient.Dgraph,
+	retries int,
+	curRetries int,
+) (string, error) {
+	fromPersonUID, err := findOrCreatePerson(
+		personID,
+		dg,
+	)
+
+	if err != nil {
+		if err.Error() != "Transaction has been aborted. Please retry." {
+			return "", err
+		}
+
+		if curRetries < retries {
+			curRetries++
+			dur := 300 * time.Duration(curRetries) * random(1, 30)
+			time.Sleep(dur * time.Millisecond)
+			return retryFindOrCreatePerson(personID, dg, retries, curRetries)
+		}
+	}
+
+	return fromPersonUID, nil
 }
 
 func transformAndLoad(e elasticUserRelationship, dg *dclient.Dgraph) {
-	// fmt.Println(e)
-	fromPersonUID, err := findOrCreatePerson(
+	fromPersonUID, err := retryFindOrCreatePerson(
 		e.FromPersonID,
 		dg,
+		3,
+		0,
 	)
 	if err != nil {
+		fmt.Println("Error creating `from` person")
 		fmt.Println(err)
 		return
 	}
 
-	toPersonUID, err := findOrCreatePerson(
+	toPersonUID, err := retryFindOrCreatePerson(
 		e.ToPersonID,
 		dg,
+		3,
+		0,
 	)
 	if err != nil {
+		fmt.Println("Error creating `to` person")
 		fmt.Println(err)
 		return
 	}
@@ -185,7 +223,7 @@ func extractElasticUserRelationships(
 			break
 		}
 
-		// total := res.TotalHits()
+		total := res.TotalHits()
 
 		for _, hit := range res.Hits.Hits {
 			var ur elasticUserRelationship
@@ -195,14 +233,16 @@ func extractElasticUserRelationships(
 				continue
 			}
 
-			/* ratio := (float64(docs) / float64(total)) * 100.0
-			fmt.Printf(
-				"%f percent (%d / %d), watermark: %d\n",
-				ratio,
-				docs,
-				total,
-				ur.LastUpdate.Unix(),
-			) */
+			if docs%1000 == 0 {
+				ratio := (float64(docs) / float64(total)) * 100.0
+				fmt.Printf(
+					"%f percent (%d / %d), watermark: %d\n",
+					ratio,
+					docs,
+					total,
+					ur.LastUpdate.Unix(),
+				)
+			}
 
 			docs++
 			channel <- ur
@@ -241,33 +281,45 @@ func transformElasticToDgraph(
 	}
 }
 
-func loadIntoDgraph(relationships []dgRelationship, dg *dclient.Dgraph) {
-	var wg sync.WaitGroup
-	wg.Add(len(relationships))
+func random(min, max int) time.Duration {
+	rand.Seed(time.Now().Unix())
+	return time.Duration(rand.Intn(max-min) + min)
+}
 
-	for _, relation := range relationships {
-		go func(r dgRelationship) {
-			defer wg.Done()
-			// fmt.Println(r)
+func retryCreateOrUpdateRelationship(
+	r *dgRelationship,
+	dg *dclient.Dgraph,
+	retries int,
+	curRetries int,
+) error {
+	err := createOrUpdateRelationship(r, dg)
+	if err != nil {
+		if err.Error() != "Transaction has been aborted. Please retry." {
+			return err
+		}
 
-			err := createOrUpdateRelationship(&r, dg)
-			if err != nil {
-				if err.Error() == "Transaction has been aborted. Please retry." {
-					time.Sleep(300 * time.Millisecond)
-					ferr := createOrUpdateRelationship(&r, dg)
-					if ferr != nil {
-						time.Sleep(500 * time.Millisecond)
-						gerr := createOrUpdateRelationship(&r, dg)
-						if gerr != nil {
-							fmt.Println(gerr)
-						}
-					}
-				}
-			}
-		}(relation)
+		if curRetries < retries {
+			curRetries++
+			dur := 300 * time.Duration(curRetries) * random(1, 30)
+			time.Sleep(dur * time.Millisecond)
+			return retryCreateOrUpdateRelationship(r, dg, retries, curRetries)
+		}
+
+		return err
 	}
 
-	wg.Wait()
+	return nil
+}
+
+func loadIntoDgraph(relationships []dgRelationship, dg *dclient.Dgraph) {
+	for _, relation := range relationships {
+		var r = relation
+		err := retryCreateOrUpdateRelationship(&r, dg, 3, 0)
+		if err != nil {
+			fmt.Println("Error creating relationship")
+			fmt.Println(err)
+		}
+	}
 }
 
 func createOrUpdateRelationship(relation *dgRelationship, dg *dclient.Dgraph) error {
