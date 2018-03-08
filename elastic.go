@@ -41,20 +41,39 @@ func (ur ElasticUserRelationship) String() string {
 	)
 }
 
+func IsTroveUser(personID string, client *elastic.Client) (bool, error) {
+	termQuery := elastic.NewTermQuery("user_id", personID)
+
+	res, err := client.Search().
+		Index("user_relationship").
+		Query(termQuery).
+		From(0).Size(1).
+		Do(context.Background())
+
+	if err != nil {
+		return false, err
+	}
+
+	return res.TotalHits() > 0, nil
+}
+
 func ExtractElasticUserRelationships(
 	client *elastic.Client,
-	watermark string,
+	watermark int64,
 	channel chan ElasticUserRelationship,
 ) {
+	defer close(channel)
+	timestamp := time.Unix(watermark, 0)
+	fmt.Printf("Starting from timestamp: %s\n", timestamp)
 	termQuery := elastic.NewRangeQuery("last_update").
-		Gte(watermark)
+		Gte(timestamp)
 
 	scroller := client.Scroll().
 		Index("user_relationship").
 		Query(termQuery).
 		Sort("last_update", true).
 		Pretty(true).
-		Size(250)
+		Size(1000)
 
 	var docs int64 = 1
 	for {
@@ -64,9 +83,16 @@ func ExtractElasticUserRelationships(
 			break
 		}
 
+		if err != nil {
+			panic(err)
+		}
+
 		total := res.TotalHits()
 
 		for _, hit := range res.Hits.Hits {
+			/* if i == 10 {
+				return
+			} */
 			var ur ElasticUserRelationship
 			err := json.Unmarshal(*hit.Source, &ur)
 			if err != nil {

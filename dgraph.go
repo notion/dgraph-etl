@@ -302,3 +302,34 @@ func CreatePerson(personID string, dg *dclient.Dgraph) (string, error) {
 	uid := assigned.Uids["blank-0"]
 	return uid, nil
 }
+
+func TransformElasticToDgraph(
+	elastic *ElasticUserRelationship,
+	FromPersonUID string,
+	ToPersonUID string,
+) []DgRelationship {
+	relationIn := DgRelationship{
+		UID: FromPersonUID,
+		HasConnection: []HasConnection{
+			HasConnection{
+				UID:   ToPersonUID,
+				Score: float64(elastic.Stats.RawScoreIn),
+			},
+		},
+	}
+
+	relationOut := DgRelationship{
+		UID: ToPersonUID,
+		HasConnection: []HasConnection{
+			HasConnection{
+				UID:   FromPersonUID,
+				Score: float64(elastic.Stats.RawScoreOut),
+			},
+		},
+	}
+
+	return []DgRelationship{
+		relationIn,
+		relationOut,
+	}
+}
