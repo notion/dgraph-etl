@@ -41,22 +41,6 @@ func (ur ElasticUserRelationship) String() string {
 	)
 }
 
-func IsTroveUser(personID string, client *elastic.Client) (bool, error) {
-	termQuery := elastic.NewTermQuery("user_id", personID)
-
-	res, err := client.Search().
-		Index("user_relationship").
-		Query(termQuery).
-		From(0).Size(1).
-		Do(context.Background())
-
-	if err != nil {
-		return false, err
-	}
-
-	return res.TotalHits() > 0, nil
-}
-
 func ExtractElasticUserRelationships(
 	client *elastic.Client,
 	watermark int64,
@@ -73,7 +57,7 @@ func ExtractElasticUserRelationships(
 		Query(termQuery).
 		Sort("last_update", true).
 		Pretty(true).
-		Size(1000)
+		Size(5000)
 
 	var docs int64 = 1
 	for {
@@ -90,7 +74,7 @@ func ExtractElasticUserRelationships(
 		total := res.TotalHits()
 
 		for _, hit := range res.Hits.Hits {
-			/* if i == 10 {
+			/* if docs >= 10000 {
 				return
 			} */
 			var ur ElasticUserRelationship
